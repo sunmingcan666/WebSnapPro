@@ -16,33 +16,43 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QSpinBox, QComboBox, QSplitter, QTabWidget, QFrame, QScrollArea,
                              QListWidgetItem, QButtonGroup, QRadioButton, QInputDialog)
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QTimer
-from PyQt5.QtGui import QFont, QPalette, QColor, QTextCursor
+from PyQt5.QtGui import QFont, QPalette, QColor, QTextCursor, QIcon
+import urllib3
+from collections import defaultdict
+import json
+from datetime import datetime
+
+# 禁用SSL警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class FileListItem(QListWidgetItem):
     """自定义列表项，存储文件路径信息"""
-    def __init__(self, filename, filepath, filesize=0):
+    def __init__(self, filename, filepath, filesize=0, filetype="unknown"):
         super().__init__()
         self.filepath = filepath
         self.filename = filename
         self.filesize = filesize  # 文件大小（字节）
+        self.filetype = filetype  # 文件类型
         
         # 格式化文件大小
         size_str = self.format_file_size(filesize)
         
         # 设置显示文本
-        self.setText(f"{filename} - {filepath} ({size_str})")
+        self.setText(f"{filename} - {size_str}")
         # 设置工具提示
-        self.setToolTip(f"文件名: {filename}\n路径: {filepath}\n大小: {size_str}\n双击在浏览器中打开")
+        self.setToolTip(f"文件名: {filename}\n路径: {filepath}\n大小: {size_str}\n类型: {filetype}\n双击在浏览器中打开")
         
         # 根据文件类型设置不同的颜色
-        if filepath.lower().endswith(('.html', '.htm')):
+        if filetype == "html":
             self.setForeground(QColor(0, 0, 139))  # 深蓝色
-        elif filepath.lower().endswith(('.css',)):
+        elif filetype == "css":
             self.setForeground(QColor(0, 100, 0))  # 深绿色
-        elif filepath.lower().endswith(('.js',)):
+        elif filetype == "javascript":
             self.setForeground(QColor(139, 0, 0))  # 深红色
-        elif filepath.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg')):
+        elif filetype == "image":
             self.setForeground(QColor(139, 69, 19))  # 深橙色
+        elif filetype == "font":
+            self.setForeground(QColor(128, 0, 128))  # 紫色
         else:
             self.setForeground(QColor(0, 0, 0))  # 黑色
 
@@ -64,9 +74,10 @@ class DownloadThread(QThread):
     log_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(bool, str)
     file_count_signal = pyqtSignal(int)
-    file_added_signal = pyqtSignal(str, str, int)  # 文件名, 文件路径, 文件大小
+    file_added_signal = pyqtSignal(str, str, int, str)  # 文件名, 文件路径, 文件大小, 文件类型
+    stats_signal = pyqtSignal(dict)  # 统计信息
     
-    def __init__(self, saver, url, download_mode, max_depth, delay_ms, thread_count):
+    def __init__(self, saver, url, download_mode, max_depth, delay_ms, thread_count, save_dir=None):
         super().__init__()
         self.saver = saver
         self.url = url
@@ -74,6 +85,7 @@ class DownloadThread(QThread):
         self.max_depth = max_depth
         self.delay_ms = delay_ms
         self.thread_count = thread_count
+        self.save_dir = save_dir
         self.is_cancelled = False
         
     def run(self):
@@ -88,7 +100,9 @@ class DownloadThread(QThread):
                 self.log_signal,
                 self.file_count_signal,
                 self.file_added_signal,
-                self.is_cancelled
+                self.stats_signal,
+                lambda: self.is_cancelled,  # 传递取消检查函数
+                self.save_dir
             )
             if not self.is_cancelled:
                 self.finished_signal.emit(True, "下载完成!")
@@ -121,6 +135,9 @@ class WebsiteSaver:
         self.delay_lock = threading.Lock()
         self.last_request_time = 0
         self.thread_count = 2  # 默认线程数
+        self.file_stats = defaultdict(int)  # 文件类型统计
+        self.size_stats = defaultdict(int)  # 文件大小统计
+        self.active_threads = []  # 活动的下载线程
         
     def reset_state(self):
         """重置状态，允许多次下载"""
@@ -132,9 +149,28 @@ class WebsiteSaver:
         self.total_files = 0
         self.downloaded_files = 0
         self.last_request_time = 0
+        self.file_stats = defaultdict(int)
+        self.size_stats = defaultdict(int)
+        self.active_threads = []
         
     def cancel_download(self):
+        """取消下载"""
         self.is_cancelled = True
+        
+        # 清空队列以快速停止下载
+        while not self.resource_queue.empty():
+            try:
+                self.resource_queue.get_nowait()
+                self.resource_queue.task_done()
+            except Empty:
+                break
+                
+        while not self.page_queue.empty():
+            try:
+                self.page_queue.get_nowait()
+                self.page_queue.task_done()
+            except Empty:
+                break
         
     def apply_delay(self):
         """应用延时，确保距离上一次请求至少间隔delay_ms毫秒"""
@@ -159,7 +195,7 @@ class WebsiteSaver:
         """
         检查URL是否有效
         """
-        if not url or url.startswith('javascript:') or url.startswith('mailto:'):
+        if not url or url.startswith('javascript:') or url.startswith('mailto:') or url.startswith('tel:'):
             return False
             
         parsed = urlparse(url)
@@ -196,20 +232,55 @@ class WebsiteSaver:
         os.makedirs(directory, exist_ok=True)
         
         return full_path
+    
+    def get_file_type(self, url, content_type):
+        """根据URL和内容类型确定文件类型"""
+        # 首先根据内容类型判断
+        if 'text/html' in content_type:
+            return "html"
+        elif 'text/css' in content_type:
+            return "css"
+        elif 'javascript' in content_type or 'application/javascript' in content_type:
+            return "javascript"
+        elif 'image/' in content_type:
+            return "image"
+        elif 'font/' in content_type or 'woff' in content_type or 'ttf' in content_type or 'otf' in content_type:
+            return "font"
         
-    def download_file(self, url, filepath, progress_signal=None, file_added_signal=None):
+        # 如果内容类型不明确，根据文件扩展名判断
+        url_lower = url.lower()
+        if url_lower.endswith(('.html', '.htm')):
+            return "html"
+        elif url_lower.endswith('.css'):
+            return "css"
+        elif url_lower.endswith('.js'):
+            return "javascript"
+        elif url_lower.endswith(('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg', '.webp')):
+            return "image"
+        elif url_lower.endswith(('.woff', '.woff2', '.ttf', '.otf', '.eot')):
+            return "font"
+        elif url_lower.endswith(('.pdf', '.doc', '.docx', '.xls', '.xlsx')):
+            return "document"
+        else:
+            return "other"
+        
+    def download_file(self, url, filepath, progress_signal=None, file_added_signal=None, stats_signal=None, is_cancelled_func=None):
         """
         下载文件并保存到指定路径
         """
-        if self.is_cancelled:
+        if is_cancelled_func and is_cancelled_func():
             return False
             
         try:
             # 应用延时
             self.apply_delay()
             
-            response = self.session.get(url, stream=True, timeout=10)
+            response = self.session.get(url, stream=True, timeout=10, verify=False)
             response.raise_for_status()
+            
+            # 检查是否取消
+            if is_cancelled_func and is_cancelled_func():
+                return False
             
             # 获取文件大小
             filesize = int(response.headers.get('content-length', 0))
@@ -222,10 +293,16 @@ class WebsiteSaver:
                 
             # 获取文件类型
             content_type = response.headers.get('content-type', '').lower()
+            file_type = self.get_file_type(url, content_type)
             
             # 如果是文本文件，使用正确编码保存
             if 'text/' in content_type:
-                content = response.content.decode(encoding, errors='replace')
+                content = response.content.decode(encoding or 'utf-8', errors='replace')
+                
+                # 检查是否取消
+                if is_cancelled_func and is_cancelled_func():
+                    return False
+                    
                 with open(filepath, 'w', encoding='utf-8') as f:
                     f.write(content)
                 # 更新实际文件大小
@@ -236,8 +313,21 @@ class WebsiteSaver:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
+                        # 检查是否取消
+                        if is_cancelled_func and is_cancelled_func():
+                            return False
                 # 获取实际文件大小
                 filesize = os.path.getsize(filepath)
+            
+            # 更新统计信息
+            with self.lock:
+                self.file_stats[file_type] += 1
+                self.size_stats[file_type] += filesize
+                if stats_signal:
+                    stats_signal.emit({
+                        'file_stats': dict(self.file_stats),
+                        'size_stats': dict(self.size_stats)
+                    })
             
             if progress_signal:
                 self.downloaded_files += 1
@@ -246,7 +336,7 @@ class WebsiteSaver:
             # 发送文件添加信号（文件名、完整路径和文件大小）
             if file_added_signal and not url.startswith("下载失败"):
                 filename = os.path.basename(filepath)
-                file_added_signal.emit(filename, filepath, filesize)
+                file_added_signal.emit(filename, filepath, filesize, file_type)
             
             return True
         except Exception as e:
@@ -255,10 +345,15 @@ class WebsiteSaver:
             return False
             
     def extract_resources(self, soup, html_content, page_url, current_domain, download_mode, 
-                         progress_signal=None, file_count_signal=None, file_added_signal=None, depth=0):
+                         progress_signal=None, file_count_signal=None, file_added_signal=None, 
+                         stats_signal=None, depth=0, is_cancelled_func=None):
         """
         从HTML中提取资源链接并下载
         """
+        # 检查是否取消
+        if is_cancelled_func and is_cancelled_func():
+            return str(soup)
+            
         # 查找所有需要下载的资源
         resource_tags = {
             'link': 'href',
@@ -276,6 +371,10 @@ class WebsiteSaver:
         css_urls = re.findall(r'url\([\'"]?(.*?)[\'"]?\)', html_content)
         
         for url in css_urls:
+            # 检查是否取消
+            if is_cancelled_func and is_cancelled_func():
+                return str(soup)
+                
             # 移除可能的多余引号
             url = url.strip('\'"')
             absolute_url = self.get_absolute_url(page_url, url)
@@ -291,6 +390,10 @@ class WebsiteSaver:
         # 查找HTML标签中的资源
         for tag, attr in resource_tags.items():
             for element in soup.find_all(tag):
+                # 检查是否取消
+                if is_cancelled_func and is_cancelled_func():
+                    return str(soup)
+                    
                 if element.has_attr(attr):
                     url = element[attr]
                     absolute_url = self.get_absolute_url(page_url, url)
@@ -312,13 +415,17 @@ class WebsiteSaver:
         # 如果下载模式不是"仅当前页面"，则处理a标签中的链接
         if download_mode != "current_page" and (download_mode == "all_pages" or depth < self.max_depth):
             for link in soup.find_all('a', href=True):
+                # 检查是否取消
+                if is_cancelled_func and is_cancelled_func():
+                    return str(soup)
+                    
                 href = link['href']
                 absolute_url = self.get_absolute_url(page_url, href)
                 
                 # 检查是否是页面链接（不是资源链接）
                 parsed = urlparse(absolute_url)
                 path = parsed.path.lower()
-                is_resource = any(path.endswith(ext) for ext in ['.css', '.js', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg', '.woff', '.ttf', '.eot'])
+                is_resource = any(path.endswith(ext) for ext in ['.css', '.js', '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico', '.svg', '.woff', '.ttf', '.eot', '.pdf', '.doc', '.docx'])
                 
                 if (self.is_valid_url(absolute_url, current_domain) and 
                     absolute_url not in self.visited_urls and
@@ -344,14 +451,23 @@ class WebsiteSaver:
         
         return str(soup)
         
-    def resource_downloader(self, progress_signal=None, log_signal=None, file_added_signal=None):
+    def resource_downloader(self, progress_signal=None, log_signal=None, file_added_signal=None, stats_signal=None, is_cancelled_func=None):
         """资源下载线程函数"""
-        while not self.is_cancelled:
+        while True:
+            # 检查是否取消
+            if is_cancelled_func and is_cancelled_func():
+                break
+                
             try:
-                url = self.resource_queue.get(timeout=1)
+                url = self.resource_queue.get(timeout=0.5)
+                # 再次检查是否取消
+                if is_cancelled_func and is_cancelled_func():
+                    self.resource_queue.task_done()
+                    break
+                    
                 filepath = self.get_local_path(url, self.save_dir)
                 # 资源文件下载时也应用延时
-                self.download_file(url, filepath, progress_signal, file_added_signal)
+                self.download_file(url, filepath, progress_signal, file_added_signal, stats_signal, is_cancelled_func)
                 self.resource_queue.task_done()
             except Empty:
                 # 检查是否还有页面需要处理
@@ -361,16 +477,28 @@ class WebsiteSaver:
             except Exception as e:
                 if log_signal:
                     log_signal.emit(f"资源下载出错: {e}")
-                self.resource_queue.task_done()
+                try:
+                    self.resource_queue.task_done()
+                except:
+                    pass
         
     def page_downloader(self, download_mode, progress_signal, log_signal, 
-                       file_count_signal, file_added_signal):
+                       file_count_signal, file_added_signal, stats_signal, is_cancelled_func):
         """页面下载线程函数"""
-        while not self.is_cancelled:
+        while True:
+            # 检查是否取消
+            if is_cancelled_func and is_cancelled_func():
+                break
+                
             try:
-                url, current_domain, depth = self.page_queue.get(timeout=1)
+                url, current_domain, depth = self.page_queue.get(timeout=0.5)
+                # 再次检查是否取消
+                if is_cancelled_func and is_cancelled_func():
+                    self.page_queue.task_done()
+                    break
+                    
                 self.download_page(url, current_domain, download_mode, progress_signal, 
-                                 log_signal, file_count_signal, file_added_signal, depth)
+                                 log_signal, file_count_signal, file_added_signal, stats_signal, depth, is_cancelled_func)
                 self.page_queue.task_done()
             except Empty:
                 # 检查是否还有资源需要处理
@@ -380,18 +508,19 @@ class WebsiteSaver:
             except Exception as e:
                 if log_signal:
                     log_signal.emit(f"页面下载出错: {e}")
-                self.page_queue.task_done()
+                try:
+                    self.page_queue.task_done()
+                except:
+                    pass
     
     def save_website(self, url, download_mode="current_page", max_depth=1, delay_ms=0, thread_count=2,
                     progress_signal=None, log_signal=None, file_count_signal=None, 
-                    file_added_signal=None, is_cancelled=False):
+                    file_added_signal=None, stats_signal=None, is_cancelled_func=None, save_dir=None):
         """
         主函数：保存网站
         """
         # 重置状态，允许多次下载
         self.reset_state()
-        self.is_cancelled = is_cancelled
-        self.max_depth = max_depth
         self.delay_ms = delay_ms  # 设置延时
         self.thread_count = thread_count  # 设置线程数
         
@@ -399,7 +528,11 @@ class WebsiteSaver:
         self.initial_domain = parsed.netloc
         
         # 创建保存目录
-        self.save_dir = os.path.join(os.getcwd(), "saved_websites", self.initial_domain)
+        if save_dir:
+            self.save_dir = save_dir
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.save_dir = os.path.join(os.getcwd(), "saved_websites", f"{self.initial_domain}_{timestamp}")
         os.makedirs(self.save_dir, exist_ok=True)
         
         if log_signal:
@@ -430,56 +563,72 @@ class WebsiteSaver:
         page_thread = threading.Thread(
             target=self.page_downloader,
             args=(download_mode, progress_signal, log_signal, 
-                 file_count_signal, file_added_signal)
+                 file_count_signal, file_added_signal, stats_signal, is_cancelled_func)
         )
         page_thread.daemon = True
         page_thread.start()
+        self.active_threads.append(page_thread)
         
         # 创建多个资源下载线程
         resource_threads = []
         for i in range(thread_count):
             thread = threading.Thread(
                 target=self.resource_downloader,
-                args=(progress_signal, log_signal, file_added_signal)
+                args=(progress_signal, log_signal, file_added_signal, stats_signal, is_cancelled_func)
             )
             thread.daemon = True
             thread.start()
             resource_threads.append(thread)
+            self.active_threads.append(thread)
         
-        # 等待所有任务完成
-        self.page_queue.join()
-        self.resource_queue.join()
+        # 等待所有任务完成或取消
+        try:
+            self.page_queue.join()
+            self.resource_queue.join()
+        except:
+            pass
+        
+        # 等待所有线程结束
+        for thread in self.active_threads:
+            try:
+                thread.join(timeout=1.0)
+            except:
+                pass
         
         # 确保进度条到达100%
-        if progress_signal and self.total_files > 0:
+        if progress_signal and self.total_files > 0 and not (is_cancelled_func and is_cancelled_func()):
             progress_signal.emit(self.total_files, self.total_files, "下载完成")
         
-        if not self.is_cancelled and log_signal:
+        if not (is_cancelled_func and is_cancelled_func()) and log_signal:
             log_signal.emit("网站保存完成!")
         
     def download_page(self, url, current_domain, download_mode="current_page", 
                      progress_signal=None, log_signal=None, file_count_signal=None, 
-                     file_added_signal=None, depth=0):
+                     file_added_signal=None, stats_signal=None, depth=0, is_cancelled_func=None):
         """
         下载单个页面
         """
-        if self.is_cancelled:
+        if is_cancelled_func and is_cancelled_func():
             return
             
         try:
             # 应用延时
             self.apply_delay()
             
-            response = self.session.get(url, timeout=10)
+            response = self.session.get(url, timeout=10, verify=False)
             response.raise_for_status()
             
+            # 检查是否取消
+            if is_cancelled_func and is_cancelled_func():
+                return
+                
             # 检测编码
             if response.encoding == 'ISO-8859-1':
                 encoding = response.apparent_encoding
             else:
                 encoding = response.encoding
                 
-            content = response.content.decode(encoding, errors='replace')
+            content = response.content.decode(encoding or 'utf-8', errors='replace')
             
             content_type = response.headers.get('content-type', '').lower()
             
@@ -497,9 +646,13 @@ class WebsiteSaver:
                     # 提取并下载资源
                     modified_html = self.extract_resources(
                         soup, content, url, current_domain, download_mode, 
-                        progress_signal, file_count_signal, file_added_signal, depth
+                        progress_signal, file_count_signal, file_added_signal, stats_signal, depth, is_cancelled_func
                     )
                     
+                    # 检查是否取消
+                    if is_cancelled_func and is_cancelled_func():
+                        return
+                        
                     # 保存修改后的HTML
                     filepath = self.get_local_path(url, self.save_dir)
                     with open(filepath, 'w', encoding='utf-8') as f:
@@ -508,6 +661,17 @@ class WebsiteSaver:
                 # 获取文件大小
                 filesize = os.path.getsize(filepath)
                 
+                # 更新统计信息
+                file_type = self.get_file_type(url, content_type)
+                with self.lock:
+                    self.file_stats[file_type] += 1
+                    self.size_stats[file_type] += filesize
+                    if stats_signal:
+                        stats_signal.emit({
+                            'file_stats': dict(self.file_stats),
+                            'size_stats': dict(self.size_stats)
+                        })
+                
                 if progress_signal:
                     self.downloaded_files += 1
                     progress_signal.emit(self.downloaded_files, self.total_files, url)
@@ -515,7 +679,7 @@ class WebsiteSaver:
                 # 发送文件添加信号
                 if file_added_signal:
                     filename = os.path.basename(filepath)
-                    file_added_signal.emit(filename, filepath, filesize)
+                    file_added_signal.emit(filename, filepath, filesize, file_type)
                 
                 if log_signal:
                     log_signal.emit(f"页面保存成功: {url} (深度: {depth})")
@@ -533,6 +697,17 @@ class WebsiteSaver:
                 # 获取文件大小
                 filesize = os.path.getsize(filepath)
                 
+                # 更新统计信息
+                file_type = self.get_file_type(url, content_type)
+                with self.lock:
+                    self.file_stats[file_type] += 1
+                    self.size_stats[file_type] += filesize
+                    if stats_signal:
+                        stats_signal.emit({
+                            'file_stats': dict(self.file_stats),
+                            'size_stats': dict(self.size_stats)
+                        })
+                
                 if progress_signal:
                     self.downloaded_files += 1
                     progress_signal.emit(self.downloaded_files, self.total_files, url)
@@ -540,7 +715,7 @@ class WebsiteSaver:
                 # 发送文件添加信号
                 if file_added_signal:
                     filename = os.path.basename(filepath)
-                    file_added_signal.emit(filename, filepath, filesize)
+                    file_added_signal.emit(filename, filepath, filesize, filetype)
                 
                 if log_signal:
                     log_signal.emit(f"资源保存成功: {url}")
@@ -555,11 +730,13 @@ class WebSnapProUI(QMainWindow):
         self.saver = WebsiteSaver()
         self.download_thread = None
         self.all_files = []  # 存储所有文件信息
+        self.filtered_files = []  # 存储筛选后的文件
+        self.current_stats = {}  # 当前统计信息
         self.init_ui()
         
     def init_ui(self):
         self.setWindowTitle('WebSnapPro - 网站代码下载工具')
-        self.setGeometry(100, 100, 1200, 900)  # 增大窗口尺寸
+        self.setGeometry(100, 100, 1400, 900)  # 增大窗口尺寸
         
         # 设置应用样式
         self.setStyleSheet("""
@@ -667,6 +844,27 @@ class WebSnapProUI(QMainWindow):
             QListWidget::item:hover {
                 background-color: #f8f9fa;
             }
+            QTabWidget::pane {
+                border: 1px solid #dcdde1;
+                border-radius: 5px;
+                background-color: white;
+            }
+            QTabBar::tab {
+                background: #ecf0f1;
+                border: 1px solid #dcdde1;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected {
+                background: #3498db;
+                color: white;
+                border-bottom-color: #3498db;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #d6dbdf;
+            }
         """)
         
         # 中央部件
@@ -674,31 +872,52 @@ class WebSnapProUI(QMainWindow):
         self.setCentralWidget(central_widget)
         
         # 主布局
-        main_layout = QVBoxLayout(central_widget)
+        main_layout = QHBoxLayout(central_widget)
         main_layout.setSpacing(12)
         main_layout.setContentsMargins(20, 20, 20, 20)
         
+        # 左侧区域 - 文件列表和统计信息
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setSpacing(12)
+        
         # URL输入区域
         url_group = QGroupBox("网站地址")
-        url_layout = QHBoxLayout()
-        url_layout.setSpacing(12)
+        url_layout = QVBoxLayout()
+        
+        # 保存位置显示
+        save_location_layout = QHBoxLayout()
+        save_location_layout.addWidget(QLabel("保存位置:"))
+        
+        self.save_location_label = QLabel("未设置")
+        self.save_location_label.setStyleSheet("background-color: #e3f2fd; padding: 5px; border-radius: 3px;")
+        self.save_location_label.setWordWrap(True)
+        save_location_layout.addWidget(self.save_location_label, 1)
+        
+        url_layout.addLayout(save_location_layout)
+        
+        # URL输入行
+        url_input_layout = QHBoxLayout()
+        url_input_layout.setSpacing(12)
         
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("请输入网站URL (例如: https://example.com)")
-        url_layout.addWidget(self.url_input)
+        url_input_layout.addWidget(self.url_input)
         
         self.download_btn = QPushButton("开始下载")
         self.download_btn.clicked.connect(self.start_download)
-        url_layout.addWidget(self.download_btn)
+        url_input_layout.addWidget(self.download_btn)
         
         self.cancel_btn = QPushButton("取消下载")
         self.cancel_btn.setObjectName("cancelButton")
         self.cancel_btn.clicked.connect(self.cancel_download)
         self.cancel_btn.setEnabled(False)
-        url_layout.addWidget(self.cancel_btn)
+        url_input_layout.addWidget(self.cancel_btn)
+        
+        url_layout.addLayout(url_input_layout)
         
         url_group.setLayout(url_layout)
-        main_layout.addWidget(url_group)
+        left_layout.addWidget(url_group)
         
         # 选项区域
         options_group = QGroupBox("下载选项")
@@ -762,7 +981,7 @@ class WebSnapProUI(QMainWindow):
         
         options_layout.addLayout(other_options_layout)
         options_group.setLayout(options_layout)
-        main_layout.addWidget(options_group)
+        left_layout.addWidget(options_group)
         
         # 连接单选按钮信号
         self.current_page_radio.toggled.connect(self.on_mode_changed)
@@ -782,7 +1001,14 @@ class WebSnapProUI(QMainWindow):
         progress_layout.addWidget(self.status_label)
         
         progress_group.setLayout(progress_layout)
-        main_layout.addWidget(progress_group)
+        left_layout.addWidget(progress_group)
+        
+        # 创建标签页
+        self.tab_widget = QTabWidget()
+        
+        # 文件列表标签页
+        files_tab = QWidget()
+        files_layout = QVBoxLayout(files_tab)
         
         # 文件筛选区域
         filter_group = QGroupBox("文件筛选")
@@ -791,7 +1017,7 @@ class WebSnapProUI(QMainWindow):
         filter_layout.addWidget(QLabel("筛选方式:"))
         
         self.filter_combo = QComboBox()
-        self.filter_combo.addItems(["所有文件", "扩展名", "文件名", "文件大小"])
+        self.filter_combo.addItems(["所有文件", "HTML文件", "CSS文件", "JavaScript文件", "图片文件", "字体文件", "扩展名", "文件名", "文件大小"])
         self.filter_combo.currentTextChanged.connect(self.on_filter_changed)
         filter_layout.addWidget(self.filter_combo)
         
@@ -810,31 +1036,9 @@ class WebSnapProUI(QMainWindow):
         filter_layout.addWidget(self.clear_filter_btn)
         
         filter_group.setLayout(filter_layout)
-        main_layout.addWidget(filter_group)
+        files_layout.addWidget(filter_group)
         
-        # 日志和文件列表区域
-        log_splitter = QSplitter(Qt.Horizontal)
-        
-        # 日志区域
-        log_group = QGroupBox("下载日志")
-        log_layout = QVBoxLayout()
-        
-        self.log_output = QTextEdit()
-        self.log_output.setReadOnly(True)
-        log_layout.addWidget(self.log_output)
-        
-        # 添加清空日志按钮
-        clear_log_btn = QPushButton("清空日志")
-        clear_log_btn.clicked.connect(self.log_output.clear)
-        log_layout.addWidget(clear_log_btn)
-        
-        log_group.setLayout(log_layout)
-        log_splitter.addWidget(log_group)
-        
-        # 文件列表区域
-        files_group = QGroupBox("已下载文件")
-        files_layout = QVBoxLayout()
-        
+        # 文件列表
         self.file_list = QListWidget()
         self.file_list.itemDoubleClicked.connect(self.open_file_in_browser)
         files_layout.addWidget(self.file_list)
@@ -850,19 +1054,66 @@ class WebSnapProUI(QMainWindow):
         refresh_btn.clicked.connect(self.refresh_file_list)
         file_buttons_layout.addWidget(refresh_btn)
         
+        export_btn = QPushButton("导出列表")
+        export_btn.clicked.connect(self.export_file_list)
+        file_buttons_layout.addWidget(export_btn)
+        
         files_layout.addLayout(file_buttons_layout)
         
-        files_group.setLayout(files_layout)
-        log_splitter.addWidget(files_group)
+        # 统计信息标签页
+        stats_tab = QWidget()
+        stats_layout = QVBoxLayout(stats_tab)
         
-        log_splitter.setSizes([700, 500])
-        main_layout.addWidget(log_splitter, 1)
+        stats_group = QGroupBox("下载统计")
+        stats_inner_layout = QVBoxLayout()
+        
+        self.stats_text = QTextEdit()
+        self.stats_text.setReadOnly(True)
+        stats_inner_layout.addWidget(self.stats_text)
+        
+        stats_group.setLayout(stats_inner_layout)
+        stats_layout.addWidget(stats_group)
+        
+        # 添加标签页
+        self.tab_widget.addTab(files_tab, "文件列表")
+        self.tab_widget.addTab(stats_tab, "统计信息")
+        
+        left_layout.addWidget(self.tab_widget, 1)
+        
+        # 右侧区域 - 下载日志
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        
+        # 日志区域
+        log_group = QGroupBox("下载日志")
+        log_layout = QVBoxLayout()
+        
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        log_layout.addWidget(self.log_output)
+        
+        # 添加清空日志按钮
+        clear_log_btn = QPushButton("清空日志")
+        clear_log_btn.clicked.connect(self.log_output.clear)
+        log_layout.addWidget(clear_log_btn)
+        
+        log_group.setLayout(log_layout)
+        right_layout.addWidget(log_group)
+        
+        # 将左右区域添加到主布局
+        main_layout.addWidget(left_widget, 2)  # 左侧占2/3宽度
+        main_layout.addWidget(right_widget, 1)  # 右侧占1/3宽度
         
         # 状态栏
         self.statusBar().showMessage("准备就绪")
         
         # 初始化保存目录
         self.saver.save_dir = os.path.join(os.getcwd(), "saved_websites")
+        self.update_save_location_label()
+        
+    def update_save_location_label(self):
+        """更新保存位置标签"""
+        self.save_location_label.setText(self.saver.save_dir)
         
     def on_mode_changed(self):
         """下载模式改变时的处理"""
@@ -871,32 +1122,43 @@ class WebSnapProUI(QMainWindow):
         
     def on_filter_changed(self, text):
         """筛选类型改变时的处理"""
-        self.filter_input.setEnabled(text != "所有文件")
-        self.apply_filter_btn.setEnabled(text != "所有文件")
-        if text == "所有文件":
-            self.clear_filter()
+        # 预设的文件类型筛选不需要输入框
+        if text in ["所有文件", "HTML文件", "CSS文件", "JavaScript文件", "图片文件", "字体文件"]:
+            self.filter_input.setEnabled(False)
+            self.apply_filter_btn.setEnabled(True)
+        else:
+            self.filter_input.setEnabled(True)
+            self.apply_filter_btn.setEnabled(True)
         
     def apply_filter(self):
         """应用文件筛选"""
         filter_type = self.filter_combo.currentText()
         filter_value = self.filter_input.text().strip()
         
-        if not filter_value:
-            return
-            
         self.file_list.clear()
+        self.filtered_files = []
         
-        for filename, filepath, filesize in self.all_files:
+        for filename, filepath, filesize, filetype in self.all_files:
             show_item = False
             
-            if filter_type == "扩展名":
-                if filepath.lower().endswith(tuple(ext.strip() for ext in filter_value.split(','))):
+            if filter_type == "所有文件":
+                show_item = True
+            elif filter_type == "HTML文件":
+                show_item = filetype == "html"
+            elif filter_type == "CSS文件":
+                show_item = filetype == "css"
+            elif filter_type == "JavaScript文件":
+                show_item = filetype == "javascript"
+            elif filter_type == "图片文件":
+                show_item = filetype == "image"
+            elif filter_type == "字体文件":
+                show_item = filetype == "font"
+            elif filter_type == "扩展名":
+                if filter_value and filepath.lower().endswith(tuple(ext.strip() for ext in filter_value.split(','))):
                     show_item = True
-                    
             elif filter_type == "文件名":
-                if filter_value.lower() in filename.lower():
+                if filter_value and filter_value.lower() in filename.lower():
                     show_item = True
-                    
             elif filter_type == "文件大小":
                 try:
                     if filter_value.startswith('>'):
@@ -912,8 +1174,12 @@ class WebSnapProUI(QMainWindow):
                     show_item = False
             
             if show_item:
-                item = FileListItem(filename, filepath, filesize)
+                self.filtered_files.append((filename, filepath, filesize, filetype))
+                item = FileListItem(filename, filepath, filesize, filetype)
                 self.file_list.addItem(item)
+                
+        # 更新状态栏
+        self.statusBar().showMessage(f"已筛选 {len(self.filtered_files)} 个文件 (总共 {len(self.all_files)} 个文件)")
                 
     def parse_size(self, size_str):
         """解析大小字符串为字节数"""
@@ -930,14 +1196,41 @@ class WebSnapProUI(QMainWindow):
     def clear_filter(self):
         """清除筛选"""
         self.filter_input.clear()
+        self.filter_combo.setCurrentIndex(0)
         self.refresh_file_list()
         
     def refresh_file_list(self):
         """刷新文件列表"""
         self.file_list.clear()
-        for filename, filepath, filesize in self.all_files:
-            item = FileListItem(filename, filepath, filesize)
+        self.filtered_files = self.all_files.copy()
+        for filename, filepath, filesize, filetype in self.all_files:
+            item = FileListItem(filename, filepath, filesize, filetype)
             self.file_list.addItem(item)
+        
+        # 更新状态栏
+        self.statusBar().showMessage(f"已加载 {len(self.all_files)} 个文件")
+        
+    def export_file_list(self):
+        """导出文件列表到CSV"""
+        if not self.all_files:
+            QMessageBox.warning(self, "警告", "没有文件可导出")
+            return
+            
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出文件列表", "file_list.csv", "CSV Files (*.csv)"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write("文件名,文件路径,文件大小,文件类型\n")
+                    for filename, filepath, filesize, filetype in self.all_files:
+                        size_str = FileListItem("", "", filesize).format_file_size(filesize)
+                        f.write(f'"{filename}","{filepath}","{size_str}","{filetype}"\n')
+                
+                QMessageBox.information(self, "成功", f"文件列表已导出到 {file_path}")
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"导出失败: {str(e)}")
         
     def start_download(self):
         url = self.url_input.text().strip()
@@ -974,7 +1267,9 @@ class WebSnapProUI(QMainWindow):
         self.log_output.clear()
         self.file_list.clear()
         self.all_files.clear()
+        self.filtered_files.clear()
         self.progress_bar.setValue(0)
+        self.stats_text.clear()
         
         # 创建下载线程
         self.download_thread = DownloadThread(
@@ -983,7 +1278,8 @@ class WebSnapProUI(QMainWindow):
             download_mode,
             max_depth,
             delay_ms,
-            thread_count
+            thread_count,
+            self.saver.save_dir
         )
         
         # 连接信号
@@ -992,14 +1288,17 @@ class WebSnapProUI(QMainWindow):
         self.download_thread.finished_signal.connect(self.download_finished)
         self.download_thread.file_count_signal.connect(self.update_total_files)
         self.download_thread.file_added_signal.connect(self.add_file_to_list)
+        self.download_thread.stats_signal.connect(self.update_stats)
         
         # 启动线程
         self.download_thread.start()
         
     def cancel_download(self):
         if self.download_thread and self.download_thread.isRunning():
-            self.download_thread.cancel()
             self.log_message("正在取消下载...")
+            self.download_thread.cancel()
+            # 立即禁用取消按钮，避免重复点击
+            self.cancel_btn.setEnabled(False)
             
     def download_finished(self, success, message):
         self.log_message(message)
@@ -1010,6 +1309,8 @@ class WebSnapProUI(QMainWindow):
             self.statusBar().showMessage("下载完成")
             if self.progress_bar.maximum() > 0:
                 self.progress_bar.setValue(self.progress_bar.maximum())
+            # 更新统计信息
+            self.update_stats_display()
         else:
             self.statusBar().showMessage("下载失败")
             
@@ -1025,20 +1326,64 @@ class WebSnapProUI(QMainWindow):
             else:
                 self.status_label.setText(f"进度: {current}/{total} - 错误")
                 
-    def add_file_to_list(self, filename, filepath, filesize):
+    def add_file_to_list(self, filename, filepath, filesize, filetype):
         """添加文件到文件列表"""
         if filename and not filename.startswith("下载失败") and not filename == "下载完成":
             # 保存文件信息
-            self.all_files.append((filename, filepath, filesize))
+            self.all_files.append((filename, filepath, filesize, filetype))
             
-            # 添加到列表
-            item = FileListItem(filename, filepath, filesize)
-            self.file_list.addItem(item)
-            self.file_list.scrollToBottom()
+            # 如果当前没有筛选或者文件符合筛选条件，则添加到列表
+            if not self.filtered_files or (
+                (self.filter_combo.currentText() == "所有文件") or
+                (self.filter_combo.currentText() == "HTML文件" and filetype == "html") or
+                (self.filter_combo.currentText() == "CSS文件" and filetype == "css") or
+                (self.filter_combo.currentText() == "JavaScript文件" and filetype == "javascript") or
+                (self.filter_combo.currentText() == "图片文件" and filetype == "image") or
+                (self.filter_combo.currentText() == "字体文件" and filetype == "font")
+            ):
+                item = FileListItem(filename, filepath, filesize, filetype)
+                self.file_list.addItem(item)
+                self.file_list.scrollToBottom()
+                
+        # 更新状态栏
+        self.statusBar().showMessage(f"已下载 {len(self.all_files)} 个文件")
                 
     def update_total_files(self, total):
         """更新总文件数"""
         self.progress_bar.setMaximum(total)
+        
+    def update_stats(self, stats):
+        """更新统计信息"""
+        self.current_stats = stats
+        self.update_stats_display()
+        
+    def update_stats_display(self):
+        """更新统计信息显示"""
+        if not self.current_stats:
+            return
+            
+        stats_text = "=== 下载统计 ===\n\n"
+        
+        # 文件数量统计
+        stats_text += "文件数量统计:\n"
+        total_files = sum(self.current_stats.get('file_stats', {}).values())
+        for file_type, count in self.current_stats.get('file_stats', {}).items():
+            percentage = (count / total_files * 100) if total_files > 0 else 0
+            stats_text += f"  {file_type}: {count} ({percentage:.1f}%)\n"
+        
+        stats_text += f"\n总文件数: {total_files}\n\n"
+        
+        # 文件大小统计
+        stats_text += "文件大小统计:\n"
+        total_size = sum(self.current_stats.get('size_stats', {}).values())
+        for file_type, size in self.current_stats.get('size_stats', {}).items():
+            size_str = FileListItem("", "", size).format_file_size(size)
+            percentage = (size / total_size * 100) if total_size > 0 else 0
+            stats_text += f"  {file_type}: {size_str} ({percentage:.1f}%)\n"
+        
+        stats_text += f"\n总大小: {FileListItem('', '', total_size).format_file_size(total_size)}\n"
+        
+        self.stats_text.setText(stats_text)
                 
     def log_message(self, message):
         self.log_output.append(f"{time.strftime('%H:%M:%S')} - {message}")
@@ -1048,12 +1393,21 @@ class WebSnapProUI(QMainWindow):
         directory = QFileDialog.getExistingDirectory(self, "选择保存目录")
         if directory:
             self.saver.save_dir = directory
+            self.update_save_location_label()
             self.log_message(f"保存目录设置为: {directory}")
             
     def open_save_folder(self):
         """打开保存文件夹"""
         if os.path.exists(self.saver.save_dir):
-            os.startfile(self.saver.save_dir)
+            try:
+                if sys.platform == 'win32':
+                    os.startfile(self.saver.save_dir)
+                elif sys.platform == 'darwin':
+                    os.system(f'open "{self.saver.save_dir}"')
+                else:
+                    os.system(f'xdg-open "{self.saver.save_dir}"')
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"无法打开文件夹: {str(e)}")
         else:
             QMessageBox.information(self, "提示", "保存目录不存在")
             
@@ -1066,12 +1420,21 @@ class WebSnapProUI(QMainWindow):
                 if filepath.lower().endswith(('.html', '.htm')):
                     try:
                         # 使用默认浏览器打开文件
-                        webbrowser.open(f'file:///{filepath}')
+                        webbrowser.open(f'file:///{os.path.abspath(filepath)}')
                         self.log_message(f"在浏览器中打开: {filepath}")
                     except Exception as e:
                         QMessageBox.warning(self, "警告", f"无法打开文件: {e}")
                 else:
-                    QMessageBox.information(self, "提示", "只有HTML文件可以在浏览器中打开")
+                    # 对于非HTML文件，尝试用系统默认程序打开
+                    try:
+                        if sys.platform == 'win32':
+                            os.startfile(filepath)
+                        elif sys.platform == 'darwin':
+                            os.system(f'open "{filepath}"')
+                        else:
+                            os.system(f'xdg-open "{filepath}"')
+                    except Exception as e:
+                        QMessageBox.information(self, "提示", f"无法打开文件: {str(e)}")
             else:
                 QMessageBox.warning(self, "警告", "文件不存在")
 
